@@ -1,0 +1,162 @@
+import numpy as np
+import bitarray
+import sys
+import re
+import math
+
+from utils import get_model, encode_context
+
+from arithmetic import encode_arithmetic, decode_arithmetic
+from block_baseline import get_bins, encode_block, decode_block
+from huffman_baseline import encode_huffman, decode_huffman
+from sample import sample
+from saac import encode_saac, decode_saac
+
+
+def main():
+    print("loading GPT-2 LM to GPU")
+    enc, model = get_model(model_name='gpt2')
+    print("finish loading !")
+    
+    ## PARAMETERS
+    message_str = "Good mood with bad weather"
+
+
+    # fix situation: directly encode the text.
+    # print("directly encode the plain txt:\n", enc.encode(message_str))
+    # print("Decode back:\n", enc.decode(enc.encode(message_str)))
+
+    # can ensure the problem arise in the arithmetic_decode as well as the arithmetic_encode function.
+
+    # ----------------------start test----------------------------
+    # test_str = "hello world."
+    # print("test_str = ", test_str)
+    # out = enc.encode(test_str)
+    # print("out = ", out)
+    # decode_str = enc.decode(out)
+    # print("decode_str = ", decode_str)
+    # print("enc.encode(decode_str) = ", enc.encode(decode_str))
+    # ----------------------stop test-----------------------------
+
+    # Basic Initialization----------------------------------
+    print("plain_text is {}".format(message_str))
+    unicode_enc = False
+    mode = 'saac'
+    block_size = 3                  # for huffman and bins
+    temp = 0.9                      # for arithmetic
+    precision = 26                  # for arithmetic
+    sample_tokens = 100             # for sample
+    topk = 300
+    device = 'cuda'                 
+    finish_sent=False               # whether or not to force finish sent. If so, stats displayed will be for non-finished sentence
+    nucleus = 0.95                  # for saac
+
+    ## VALIDATE PARAMETERS
+    if mode not in ['arithmetic', 'huffman', 'bins', 'sample', 'saac']:
+        raise NotImplementedError
+
+    if mode == 'bins':
+        bin2words, words2bin = get_bins(len(enc.encoder), block_size)
+
+    context = \
+"""In the weirdest of twists at the end of his presidency, President Donald Trump is now in league with Nancy Pelosi, Chuck Schumer and Bernie Sanders over $2,000 Covid-19 relief checks, doing battle with Republican leaders over Pentagon policy and warning the political party he overtook and remade in his own image could soon be dead."""
+    print("implication of {}".format(mode))
+
+    context_tokens = encode_context(context, enc)
+
+    # ------------------------------------------------------------------------------------
+    # ------------------------------------------------------------------------------------
+
+    # First encode message to uniform bits, without any context
+    # (not essential this is arithmetic vs ascii, but it's more efficient when the message is natural language)
+    if unicode_enc:
+        ba = bitarray.bitarray()
+        ba.frombytes(message_str.encode('utf-8'))
+        message = ba.tolist()
+    else:
+        message_ctx = [enc.encoder['<|endoftext|>']]
+        message_str += '<eos>'
+        message = decode_arithmetic(model, enc, message_str, message_ctx, precision=40, topk=60000)
+        # message = decode_arithmetic(model, enc, message_str, message_ctx, precision=precision, topk=topk, temp=temp)
+
+    print("First encode the text to a bit sequence!")
+    print(message)
+    print("the length is {}".format(len(message)))
+
+
+
+
+    # Next encode bits into cover text, using arbitrary context
+    Hq = 0
+    if mode == 'arithmetic':
+        out, nll, kl, words_per_bit, Hq = encode_arithmetic(model, enc, message, context_tokens, temp=temp, finish_sent=finish_sent, precision=precision, topk=topk)
+    elif mode == 'huffman':
+        out, nll, kl, words_per_bit = encode_huffman(model, enc, message, context_tokens, block_size, finish_sent=finish_sent)
+    elif mode == 'bins':
+        out, nll, kl, words_per_bit = encode_block(model, enc, message, context_tokens, block_size, bin2words, words2bin, finish_sent=finish_sent)
+    elif mode == 'sample':
+        out, nll, kl, Hq = sample(model, enc, sample_tokens, context_tokens, temperature=temp, topk=topk)
+        words_per_bit = 1
+    elif mode == 'saac':
+        out, nll, kl, words_per_bit, Hq, topk_list, case_studies = encode_saac(model, enc, message, context_tokens, device=device, temp=temp, precision=precision, topk=topk, nucleus=nucleus)
+    #     add thing contains device='cuda', temp=1.0, precision=26, topk=50, nucleus=0.95.
+    text = enc.decode(out)
+
+    print("="*40 + " Encoding " + "="*40)
+    print(text)
+    print('ppl: %0.2f, kl: %0.3f, words/bit: %0.2f, bits/word: %0.2f, entropy: %.2f' % (math.exp(nll), kl, words_per_bit, 1/words_per_bit, Hq/0.69315))
+    
+    # Decode binary message from bits using the same arbitrary context
+    if mode != 'sample':
+        if mode == 'arithmetic':
+            message_rec = decode_arithmetic(model, enc, text, context_tokens, temp=temp, precision=precision, topk=topk)
+        elif mode == 'huffman':
+            message_rec = decode_huffman(model, enc, text, context_tokens, block_size)
+        elif mode == 'bins':
+            message_rec = decode_block(model, enc, text, context_tokens, block_size, bin2words, words2bin)
+        elif mode == 'saac':
+            message_rec = decode_saac(model, enc, text, context_tokens, device=device, temp=temp, precision=precision, topk=topk, nucleus=nucleus)
+
+        print("="*40 + " Recovered Message " + "="*40)
+        print(message_rec)
+        print("=" * 80)
+        # Finally map message bits back to original text
+        if unicode_enc:
+            message_rec = [bool(item) for item in message_rec]
+            ba = bitarray.bitarray(message_rec)
+            reconst = ba.tobytes().decode('utf-8', 'ignore')
+        else:
+            reconst = encode_arithmetic(model, enc, message_rec, message_ctx, precision=40, topk=60000)
+            # reconst = encode_arithmetic(model, enc, message_rec, message_ctx, temp=temp, precision=precision, topk=topk)
+            # print("reconst[0] is", format(reconst[0]))
+            reconst = enc.decode(reconst[0])
+        print("The decode text is ")
+        print(reconst)
+
+if __name__ == '__main__':
+    main()
+
+
+
+
+# result:
+# bins:
+# [0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]
+# [0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]
+
+# arithmetic:
+# [0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]
+# [0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+# huffman:
+# [0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]
+# [0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]
+
+# 第一处：message = decode_arithmetic(model, enc, message_str, message_ctx, precision=40, topk=60000)
+# 第二处：out, nll, kl, words_per_bit, Hq = encode_arithmetic(model, enc, message, context_tokens, temp=temp, finish_sent=finish_sent, precision=precision, topk=topk)
+# 前一个：message_rec = decode_arithmetic(model, enc, text, context_tokens, temp=temp, precision=precision, topk=topk)
+# 后一个：reconst = encode_arithmetic(model, enc, message_rec, message_ctx, precision=40, topk=60000)
+
+
+# [1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 1, 0, 1, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+# [1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 1, 0, 1, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
